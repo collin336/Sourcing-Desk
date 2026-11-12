@@ -320,8 +320,18 @@
     padding:2px 7px;border-radius:8px;font-weight:600;white-space:nowrap;
     background:rgba(92,140,184,0.16);color:var(--blue);
   }
+  .el-ref-row .el-note{color:var(--ink-soft);font-weight:500;}
+  .el-ref-row .el-badges{display:flex;gap:6px;align-items:center;justify-content:flex-end;flex-wrap:wrap;}
+  .el-ref-row .el-flag{
+    font-family:'IBM Plex Mono',monospace;font-size:0.6rem;text-transform:uppercase;letter-spacing:0.04em;
+    padding:2px 7px;border-radius:8px;font-weight:600;white-space:nowrap;
+    background:rgba(217,154,61,0.18);color:var(--amber);
+  }
+  .el-status-row{display:flex;justify-content:space-between;align-items:center;gap:10px;margin:-6px 0 14px;}
+  .el-status-text{font-family:'IBM Plex Mono',monospace;font-size:0.7rem;color:var(--ink-soft);}
   @media (max-width:720px){
     .el-ref-row{grid-template-columns:1fr;gap:4px;}
+    .el-ref-row .el-badges{justify-content:flex-start;}
   }
 
   .best-tag{font-size:0.6rem;color:var(--green);font-weight:600;letter-spacing:0.04em;}
@@ -575,8 +585,12 @@
     <div class="panel">
       <span class="panel-label">Empty Legs — Reference</span>
       <p class="radius-note" style="margin:0 0 14px;">
-        For logging a parsed Avinode (or similar) screenshot as a point-in-time snapshot — not a permanent operator database. "From" is wherever each aircraft happened to be positioned on that date, not a confirmed home base, and entries go stale within days. Not cross-referenced or added to the operator database below.
+        Live feed from the Empty/Transient Data Google Sheet — refreshes on its own every few minutes, or hit Refresh for the latest. "From" is wherever each aircraft happens to be positioned, not a confirmed home base, and a leg drops off this list on its own once its date has passed. Not cross-referenced or added to the operator database below.
       </p>
+      <div class="el-status-row">
+        <span id="elLastUpdated" class="el-status-text">Loading…</span>
+        <button id="elRefreshBtn" class="ghost" type="button">Refresh</button>
+      </div>
       <div id="elRefList"></div>
     </div>
 
@@ -43438,32 +43452,202 @@ document.querySelectorAll('table thead tr').forEach(tr=>{
 
 renderQuotes();
 
-// ---- Empty Legs reference (read-only, parsed from an Avinode screenshot) ----
-// Snapshot only — not cross-referenced against KNOWN_OPERATORS, not used in any search.
-// Currently empty — send a screenshot and ask to have it added back, and this array gets repopulated.
-const EMPTY_LEGS_REFERENCE = [
-];
+// ---- Empty Legs reference — LIVE feed from the Empty/Transient Data Google Sheet ----
+// Not cross-referenced against KNOWN_OPERATORS, not used in any search — same as before,
+// just sourced from the sheet live instead of a hand-typed array from a screenshot.
+//
+// HOW THIS IS WIRED:
+//  1) Default below uses the Google Visualization "gviz" CSV export, built from the sheet
+//     + tab (gid) you shared. This works as-is ONLY if the sheet's Share setting is
+//     "Anyone with the link" → Viewer.
+//  2) If you'd rather not loosen sharing on the sheet itself: Google Sheet → File ▸ Share ▸
+//     Publish to web → pick the specific tab (not "Entire document") → format
+//     "Comma-separated values (.csv)" → Publish → paste the resulting link below instead.
+//     It looks like: https://docs.google.com/spreadsheets/d/e/2PACX-.../pub?gid=###&single=true&output=csv
+//     Only that one tab becomes public this way — the rest of the sheet stays as-is.
+//  3) gid=721508981 is whichever tab was open when you copied the link you sent over. If
+//     that's "Raw Data" and you want "Up to date data" live here instead (or vice versa),
+//     open the tab you want and swap in the number after gid= in its address bar.
+const SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/1wJJ0ZuXJ2-JltzyqqBc9Y-6cAkHSNxuIpKPmdQMJUrI/gviz/tq?tqx=out:csv&gid=721508981";
+const EL_REFRESH_MINUTES = 5; // how often to auto-refresh while this page stays open
+
+function elEsc(s){
+  return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// Minimal CSV parser (handles quoted fields, embedded commas/quotes/newlines) —
+// needed because Routing cells like "Buffalo, NY → Bradford, PA" quote their own commas.
+function parseCSV(text){
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for(let i=0;i<text.length;i++){
+    const c = text[i], next = text[i+1];
+    if(inQuotes){
+      if(c === '"' && next === '"'){ field += '"'; i++; }
+      else if(c === '"'){ inQuotes = false; }
+      else field += c;
+    } else {
+      if(c === '"') inQuotes = true;
+      else if(c === ','){ row.push(field); field=''; }
+      else if(c === '\r'){ /* ignore, \n handles the line break */ }
+      else if(c === '\n'){ row.push(field); rows.push(row); row=[]; field=''; }
+      else field += c;
+    }
+  }
+  if(field.length || row.length){ row.push(field); rows.push(row); }
+  return rows;
+}
+
+// Aircraft type -> CATS key, matched against how these same models are already
+// categorized in KNOWN_OPERATORS elsewhere in this file (so pills stay consistent).
+function guessLegCategory(type){
+  const t = (type||'').toLowerCase();
+  if(/falcon\s*900/.test(t)) return 'heavy';
+  if(/challenger\s*(60[0-9]|650|850)\b/.test(t)) return 'heavy';
+  if(/challenger\s*(300|350|3500)\b/.test(t)) return 'supermid';
+  if(/falcon\s*50\b/.test(t)) return 'supermid';
+  if(/sovereign|\bsov\b/.test(t)) return 'supermid';
+  if(/\bxls\+?\b/.test(t)) return 'midsize';
+  if(/hawker\s*400/.test(t)) return 'light';
+  if(/\bcj2\+?\b|\bcj3\b|citation\s*ultra/.test(t)) return 'light';
+  if(/pilatus|\bpc-?12\b/.test(t)) return 'turboprop';
+  if(/global\s*express|global\s*6000|\bg550\b|\bg650\b|gulfstream\s*g5/.test(t)) return 'ulr';
+  return type || 'midsize';
+}
+
+function elFmtDate(d){
+  const p = (d||'').split('/');
+  if(p.length !== 3) return d || '';
+  return `${p[0]}/${p[1]}/${p[2].slice(-2)}`;
+}
+function elFmtDateRange(startStr, endStr){
+  if(!startStr) return '';
+  const a = elFmtDate(startStr), b = endStr ? elFmtDate(endStr) : a;
+  return a === b ? a : `${a}–${b}`;
+}
+function elParseMDY(d){
+  const p = (d||'').split('/').map(Number);
+  if(p.length !== 3 || p.some(isNaN)) return null;
+  return new Date(p[2], p[0]-1, p[1]);
+}
+
+// Split a free-text Routing cell into a clean From/To pair, or fall back to showing
+// it as a single note when there's no fixed destination (e.g. "Open Availability
+// out of Amarillo, TX"), so nothing gets silently dropped or misrepresented.
+function parseRouting(routing, depCode){
+  let text = (routing||'').trim();
+  let flag = null;
+  const mm = text.match(/\(must move\)/i);
+  if(mm){ flag = 'MUST MOVE'; text = text.replace(mm[0],'').trim(); }
+  const parts = text.split(/\s*→\s*|\s*->\s*/);
+  const left = parts[0] ? parts[0].trim() : '';
+  if(parts.length >= 2 && left && left.toLowerCase() !== 'open'){
+    return { from:left, to:parts.slice(1).join(' → ').trim(), note:null, flag };
+  }
+  return { from: depCode || '', to:null, note:text, flag };
+}
+
+function rowsToEmptyLegs(rows){
+  const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+  const out = [];
+  rows.forEach(cols=>{
+    // Sheet columns: [blank, Operator, Aircraft Type, Tail, Start, End, Routing, Dep, Arr]
+    const op = (cols[1]||'').trim();
+    const aircraft = (cols[2]||'').trim();
+    const tail = (cols[3]||'').trim();
+    const start = (cols[4]||'').trim();
+    const end = (cols[5]||'').trim();
+    const routing = (cols[6]||'').trim();
+    const dep = (cols[7]||'').trim();
+    if(!op || op.toLowerCase()==='operator') return;             // header row / blank line
+    if(!start || !/^\d+\/\d+\/\d+$/.test(start)) return;         // not a real data row
+    const endDate = elParseMDY(end) || elParseMDY(start);
+    if(endDate && endDate < todayStart) return;                  // already in the past
+
+    const { from, to, note, flag } = parseRouting(routing, dep);
+    out.push({
+      dates: elFmtDateRange(start, end),
+      from, to, note, flag, op,
+      aircraft: tail ? `${aircraft}, tail ${tail}` : aircraft,
+      cat: guessLegCategory(aircraft),
+      _start: elParseMDY(start)
+    });
+  });
+  out.sort((a,b)=> (a._start||0) - (b._start||0));
+  return out;
+}
+
+let EMPTY_LEGS_REFERENCE = [];
+let elLoadState = 'loading'; // 'loading' | 'ready' | 'error'
+let elErrorDetail = '';
 
 function renderEmptyLegsReference(){
   const wrap = document.getElementById('elRefList');
   if(!wrap) return;
+  if(elLoadState === 'loading' && EMPTY_LEGS_REFERENCE.length === 0){
+    wrap.innerHTML = `<div class="empty-note">Loading live empty-leg data…</div>`;
+    return;
+  }
+  if(elLoadState === 'error' && EMPTY_LEGS_REFERENCE.length === 0){
+    wrap.innerHTML = `<div class="empty-note" style="color:var(--red);">Couldn't load live data (${elEsc(elErrorDetail)}). Check that the tab is shared/published as described in the code comments above this, and that the link there matches it — then hit Refresh.</div>`;
+    return;
+  }
   if(EMPTY_LEGS_REFERENCE.length === 0){
-    wrap.innerHTML = `<div class="empty-note">No empty leg data loaded right now — send a screenshot and ask to have it added here.</div>`;
+    wrap.innerHTML = `<div class="empty-note">No current empty legs in the sheet right now.</div>`;
     return;
   }
   wrap.innerHTML = EMPTY_LEGS_REFERENCE.map(r => `
     <div class="el-ref-row">
-      <div class="el-dates">${r.dates}</div>
-      <div class="el-route">${r.from}<span class="arrow">→</span>${r.to}</div>
+      <div class="el-dates">${elEsc(r.dates)}</div>
+      <div class="el-route">${r.to
+        ? `${elEsc(r.from)}<span class="arrow">→</span>${elEsc(r.to)}`
+        : `<span class="el-note">${elEsc(r.note)}</span>`}</div>
       <div class="el-info">
-        <div class="el-op">${r.op}</div>
-        <div class="el-aircraft">${r.aircraft}</div>
+        <div class="el-op">${elEsc(r.op)}</div>
+        <div class="el-aircraft">${elEsc(r.aircraft)}</div>
       </div>
-      <span class="el-catpill">${CATS[r.cat]?.label || r.cat}</span>
+      <div class="el-badges">
+        <span class="el-catpill">${elEsc(CATS[r.cat]?.label || r.cat)}</span>
+        ${r.flag ? `<span class="el-flag">${elEsc(r.flag)}</span>` : ''}
+      </div>
     </div>
   `).join('');
 }
+
+async function loadEmptyLegsFromSheet(){
+  const btn = document.getElementById('elRefreshBtn');
+  const stamp = document.getElementById('elLastUpdated');
+  if(!SHEET_CSV_URL || SHEET_CSV_URL.indexOf('PASTE_') === 0){
+    elLoadState = 'error'; elErrorDetail = 'no sheet link configured yet';
+    renderEmptyLegsReference();
+    return;
+  }
+  if(btn){ btn.disabled = true; btn.textContent = 'Refreshing…'; }
+  try{
+    const res = await fetch(SHEET_CSV_URL, { cache:'no-store' });
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+    const text = await res.text();
+    EMPTY_LEGS_REFERENCE = rowsToEmptyLegs(parseCSV(text));
+    elLoadState = 'ready';
+    if(stamp) stamp.textContent = 'Last updated ' + new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+  } catch(err){
+    elLoadState = 'error';
+    elErrorDetail = (err && err.message) || 'network error';
+    if(stamp) stamp.textContent = 'Last attempt failed';
+  }
+  renderEmptyLegsReference();
+  if(btn){ btn.disabled = false; btn.textContent = 'Refresh'; }
+}
+
+const elRefreshBtnEl = document.getElementById('elRefreshBtn');
+if(elRefreshBtnEl) elRefreshBtnEl.addEventListener('click', loadEmptyLegsFromSheet);
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState === 'visible') loadEmptyLegsFromSheet();
+});
+
 renderEmptyLegsReference();
+loadEmptyLegsFromSheet();
+setInterval(loadEmptyLegsFromSheet, EL_REFRESH_MINUTES * 60 * 1000);
 
 </script>
 </body>
