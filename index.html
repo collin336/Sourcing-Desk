@@ -306,9 +306,21 @@
   /* Empty Legs reference list */
   .el-ref-row{
     display:grid;grid-template-columns:100px 1fr 1fr auto;gap:10px;align-items:center;
-    padding:10px 0;border-top:1px solid var(--line-faint);
+    padding:10px 0 10px 11px;border-top:1px solid var(--line-faint);border-left:3px solid transparent;
   }
   .el-ref-row:first-child{border-top:none;}
+  .el-ref-row.el-match{border-left-color:var(--green);background:rgba(82,160,110,0.07);}
+  .el-matchpill{
+    font-family:'IBM Plex Mono',monospace;font-size:0.6rem;text-transform:uppercase;letter-spacing:0.04em;
+    padding:2px 7px;border-radius:8px;font-weight:600;white-space:nowrap;
+    background:rgba(82,160,110,0.20);color:var(--green);
+  }
+  .el-group-label{
+    font-family:'IBM Plex Mono',monospace;font-size:0.65rem;text-transform:uppercase;letter-spacing:0.06em;
+    color:var(--ink-soft);margin:16px 0 4px;padding-top:12px;border-top:1px solid var(--line-faint);
+  }
+  .el-group-label:first-child{margin-top:0;padding-top:0;border-top:none;}
+  .el-group-label.el-group-match{color:var(--green);}
   .el-ref-row .el-dates{font-family:'IBM Plex Mono',monospace;font-size:0.72rem;color:var(--ink-soft);}
   .el-ref-row .el-route{font-family:'IBM Plex Mono',monospace;font-size:0.85rem;font-weight:600;}
   .el-ref-row .el-route .arrow{color:var(--ink-soft);font-weight:400;margin:0 4px;}
@@ -585,7 +597,7 @@
     <div class="panel">
       <span class="panel-label">Empty Legs — Reference</span>
       <p class="radius-note" style="margin:0 0 14px;">
-        Live feed from the Empty/Transient Data Google Sheet — refreshes on its own every few minutes, or hit Refresh for the latest. "From" is wherever each aircraft happens to be positioned, not a confirmed home base, and a leg drops off this list on its own once its date has passed. Not cross-referenced or added to the operator database below.
+        Live feed from the Empty/Transient Data Google Sheet — refreshes on its own every few minutes, or hit Refresh for the latest. Airport codes are filled in automatically when a city is listed without one. Plan a trip above and legs heading the same general direction and within range of that route are grouped to the top as a MATCH — not just exact airport pairs, but anything plausibly "on the way." "From" is wherever each aircraft happens to be positioned, not a confirmed home base, and a leg drops off this list on its own once its date has passed. Not cross-referenced or added to the operator database below.
       </p>
       <div class="el-status-row">
         <span id="elLastUpdated" class="el-status-text">Loading…</span>
@@ -42809,6 +42821,7 @@ document.getElementById('clearBtn').addEventListener('click', ()=>{
   currentMinRefurb = null;
   originA = null;
   destA = null;
+  renderEmptyLegsReference();
 
   document.getElementById('legsContainer').scrollIntoView({behavior:'smooth', block:'start'});
 });
@@ -42860,6 +42873,7 @@ document.getElementById('planBtn').addEventListener('click', ()=>{
   renderCategoryFit();
   renderRFQ(resolved, currentCats);
   renderRadiusResults(originA, currentCats);
+  renderEmptyLegsReference();
 
   document.getElementById('results').classList.remove('hidden');
   document.getElementById('results').scrollIntoView({behavior:'smooth', block:'nearest'});
@@ -43468,8 +43482,15 @@ renderQuotes();
 //  3) gid=721508981 is whichever tab was open when you copied the link you sent over. If
 //     that's "Raw Data" and you want "Up to date data" live here instead (or vice versa),
 //     open the tab you want and swap in the number after gid= in its address bar.
-const SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRfOfJeRWERaZ-p63_0f_mP8q_KBaX7-zOQlTdQUyu0uUfpYxRKawzEpSZV24GgOyZhXi16XHzMZTIK/pub?gid=721508981&single=true&output=csv";
+const SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/1wJJ0ZuXJ2-JltzyqqBc9Y-6cAkHSNxuIpKPmdQMJUrI/gviz/tq?tqx=out:csv&gid=721508981";
 const EL_REFRESH_MINUTES = 5; // how often to auto-refresh while this page stays open
+
+// A leg "matches" a planned trip when it's headed the same general way (within
+// BEARING_TOLERANCE_DEG of the trip's own bearing) AND either endpoint of the trip
+// or the leg comes within CORRIDOR_MILES of the other one's straight-line path —
+// i.e. the trip is roughly "on the way," not necessarily the exact same airports.
+const CORRIDOR_MILES = 200;
+const BEARING_TOLERANCE_DEG = 70;
 
 function elEsc(s){
   return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -43531,6 +43552,134 @@ function elParseMDY(d){
   return new Date(p[2], p[0]-1, p[1]);
 }
 
+// ---- Airport resolution (for showing a code next to a bare city name) ----
+// Strip common airport-type descriptor words so e.g. "Kansas City Intl, MO" lines
+// up with a routing cell that just says "Kansas City, MO".
+function stripAirportDescriptors(s){
+  return s.replace(/\b(intl|international|regional|municipal|muni|metropolitan|metro|executive|airpark|air\s*park|airport|fld|field)\b/g,'').replace(/\s+/g,' ').trim();
+}
+function normAirportName(s){
+  let t = (s||'').toLowerCase().replace(/[.\/]/g,' ').replace(/-/g,' ');
+  t = stripAirportDescriptors(t);
+  return t.replace(/\s*,\s*/g, ', ').trim();
+}
+function splitCityState(norm){
+  const i = norm.indexOf(',');
+  if(i === -1) return { city:norm.trim(), state:'' };
+  return { city:norm.slice(0,i).trim(), state:norm.slice(i+1).trim() };
+}
+const AIRPORT_BY_CODE = {};
+const AIRPORT_BY_NAME = {}; // normalized name -> ARRAY of airports (many small fields share a city name)
+AIRPORTS.forEach(a=>{
+  AIRPORT_BY_CODE[a.c] = a;
+  const key = normAirportName(a.n);
+  (AIRPORT_BY_NAME[key] = AIRPORT_BY_NAME[key] || []).push(a);
+});
+// Generic city-name fallback for routing cells with no airport code anywhere to learn
+// from (see learnOperatorCodes below, which is tried first). Resolves ONLY when the
+// name is unambiguous — exactly one candidate, either an exact normalized match or a
+// same-state word-prefix match (e.g. "Seattle, WA" -> "Seattle-Tacoma, WA"). A city
+// as common as "Jacksonville, FL" or "Santa Ana, CA" has 10-40+ small private/military
+// fields sharing that exact name in this database — picking one of those arbitrarily
+// would confidently show the WRONG airport, which is worse than showing no code at
+// all, so any ambiguity here is left unresolved on purpose.
+function findAirportByCityNameUnambiguous(str){
+  if(!str) return null;
+  const norm = normAirportName(str);
+  const exact = AIRPORT_BY_NAME[norm];
+  if(exact) return exact.length === 1 ? exact[0] : null;
+  const sc = splitCityState(norm);
+  if(!sc.city || !sc.state) return null;
+  const candidates = [];
+  for(const a of AIRPORTS){
+    const an = splitCityState(normAirportName(a.n));
+    if(an.state !== sc.state) continue;
+    if(an.city.startsWith(sc.city+' ') || sc.city.startsWith(an.city+' ')) candidates.push(a);
+  }
+  return candidates.length === 1 ? candidates[0] : null;
+}
+// Prefer an explicit code (either given directly on this row, or learned from this
+// same operator's OTHER rows for this exact city text — see learnOperatorCodes).
+// Only once both of those come up empty do we try the generic, ambiguity-safe
+// city-name fallback above.
+function resolveAirport(code, cityText){
+  const c = (code||'').trim().toUpperCase();
+  if(c && AIRPORT_BY_CODE[c]) return AIRPORT_BY_CODE[c];
+  return findAirportByCityNameUnambiguous(cityText);
+}
+// Learn each operator's own city-name -> code convention from whichever of their OWN
+// rows happen to give a code, so a blank cell for a city they fly elsewhere (almost
+// always their home base, e.g. Malone <-> KJAX) can reuse it — this is far more
+// reliable than the generic fallback above for exactly the cities that matter most,
+// since it reflects which specific field THIS operator actually uses, not just
+// whichever same-named field happens to come first in a 30,000+ row airport list.
+function learnOperatorCodes(rows){
+  const learned = {}; // "operator|normalized city text" -> code
+  rows.forEach(cols=>{
+    const op = (cols[1]||'').trim();
+    const routing = (cols[6]||'').trim();
+    const dep = (cols[7]||'').trim(), arr = (cols[8]||'').trim();
+    if(!op || op.toLowerCase()==='operator' || !routing || (!dep && !arr)) return;
+    const { from, to } = parseRouting(routing, dep);
+    if(dep && from) learned[op+'|'+normAirportName(from)] = dep;
+    if(arr && to) learned[op+'|'+normAirportName(to)] = arr;
+  });
+  return learned;
+}
+function airportLabel(resolved, originalText){
+  return resolved ? `${resolved.c} · ${originalText}` : (originalText || '');
+}
+
+// ---- Bearing / corridor geometry (for "is this leg headed the same general way,
+// and does it pass near my trip" matching) — haversineMiles() already exists above. ----
+function bearingDeg(a,b){
+  const toRad = d=>d*Math.PI/180;
+  const la1=toRad(a.lat), la2=toRad(b.lat), dLon=toRad(b.lon-a.lon);
+  const y=Math.sin(dLon)*Math.cos(la2);
+  const x=Math.cos(la1)*Math.sin(la2)-Math.sin(la1)*Math.cos(la2)*Math.cos(dLon);
+  return (Math.atan2(y,x)*180/Math.PI + 360) % 360;
+}
+function angleDiffDeg(a,b){
+  const d = Math.abs(a-b) % 360;
+  return d > 180 ? 360-d : d;
+}
+// Distance (miles) from pt to the great-circle path start->end, clamped to the
+// segment itself (if pt projects beyond either end, this is just the straight-line
+// distance to that end) — so a point only counts as "on the way" if it's actually
+// between the two airports, not just near the infinite extension of that bearing.
+function pathDistanceMiles(start, end, pt){
+  const R = 3958.8;
+  const segLen = haversineMiles(start, end);
+  const d13 = haversineMiles(start, pt) / R;
+  const brng13 = bearingDeg(start, pt), brng12 = bearingDeg(start, end);
+  const diff = angleDiffDeg(brng13, brng12) * Math.PI/180;
+  const dXt = Math.asin(Math.sin(d13) * Math.sin(diff)) * R;
+  let ratio = Math.cos(d13) / Math.cos(dXt / R);
+  ratio = Math.max(-1, Math.min(1, ratio));
+  let dAt = Math.acos(ratio) * R;
+  if(angleDiffDeg(brng13, brng12) > 90) dAt = -dAt;
+  if(dAt < 0) return haversineMiles(start, pt);
+  if(dAt > segLen) return haversineMiles(end, pt);
+  return Math.abs(dXt);
+}
+// Does this leg line up with the planned trip's direction, and does one of them
+// pass within CORRIDOR_MILES of the other's straight-line path?
+function computeLegMatch(leg, tripO, tripD){
+  if(!leg.fromAirport || !leg.toAirport || !tripO || !tripD) return null;
+  const brgDiff = angleDiffDeg(bearingDeg(tripO, tripD), bearingDeg(leg.fromAirport, leg.toAirport));
+  const dist = Math.min(
+    pathDistanceMiles(leg.fromAirport, leg.toAirport, tripO),
+    pathDistanceMiles(leg.fromAirport, leg.toAirport, tripD),
+    pathDistanceMiles(tripO, tripD, leg.fromAirport),
+    pathDistanceMiles(tripO, tripD, leg.toAirport)
+  );
+  return {
+    isMatch: brgDiff <= BEARING_TOLERANCE_DEG && dist <= CORRIDOR_MILES,
+    dist: Math.round(dist),
+    brgDiff: Math.round(brgDiff)
+  };
+}
+
 // Split a free-text Routing cell into a clean From/To pair, or fall back to showing
 // it as a single note when there's no fixed destination (e.g. "Open Availability
 // out of Amarillo, TX"), so nothing gets silently dropped or misrepresented.
@@ -43549,6 +43698,7 @@ function parseRouting(routing, depCode){
 
 function rowsToEmptyLegs(rows){
   const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+  const learned = learnOperatorCodes(rows);
   const out = [];
   rows.forEach(cols=>{
     // Sheet columns: [blank, Operator, Aircraft Type, Tail, Start, End, Routing, Dep, Arr]
@@ -43559,15 +43709,25 @@ function rowsToEmptyLegs(rows){
     const end = (cols[5]||'').trim();
     const routing = (cols[6]||'').trim();
     const dep = (cols[7]||'').trim();
+    const arr = (cols[8]||'').trim();
     if(!op || op.toLowerCase()==='operator') return;             // header row / blank line
     if(!start || !/^\d+\/\d+\/\d+$/.test(start)) return;         // not a real data row
     const endDate = elParseMDY(end) || elParseMDY(start);
     if(endDate && endDate < todayStart) return;                  // already in the past
 
     const { from, to, note, flag } = parseRouting(routing, dep);
+    let fromAirport=null, toAirport=null, fromLabel='', toLabel='';
+    if(to){ // only worth resolving for a clean A->B route; note-only rows skip this
+      const fromCode = dep || learned[op+'|'+normAirportName(from)];
+      const toCode = arr || learned[op+'|'+normAirportName(to)];
+      fromAirport = resolveAirport(fromCode, from);
+      toAirport = resolveAirport(toCode, to);
+      fromLabel = airportLabel(fromAirport, from);
+      toLabel = airportLabel(toAirport, to);
+    }
     out.push({
       dates: elFmtDateRange(start, end),
-      from, to, note, flag, op,
+      from, to, note, flag, op, fromAirport, toAirport, fromLabel, toLabel,
       aircraft: tail ? `${aircraft}, tail ${tail}` : aircraft,
       cat: guessLegCategory(aircraft),
       _start: elParseMDY(start)
@@ -43596,22 +43756,47 @@ function renderEmptyLegsReference(){
     wrap.innerHTML = `<div class="empty-note">No current empty legs in the sheet right now.</div>`;
     return;
   }
-  wrap.innerHTML = EMPTY_LEGS_REFERENCE.map(r => `
-    <div class="el-ref-row">
+
+  if(originA && destA){
+    const scored = EMPTY_LEGS_REFERENCE.map(r => ({ r, m: computeLegMatch(r, originA, destA) }));
+    const matches = scored.filter(x => x.m && x.m.isMatch).sort((a,b)=> a.m.dist - b.m.dist);
+    const rest = scored.filter(x => !(x.m && x.m.isMatch));
+    let html = '';
+    if(matches.length){
+      html += `<div class="el-group-label el-group-match">Matches for ${elEsc(originA.c)} → ${elEsc(destA.c)} (${matches.length})</div>`;
+      html += matches.map(x => elLegRowHtml(x.r, x.m)).join('');
+      html += `<div class="el-group-label">Other current availability</div>`;
+    } else {
+      html += `<div class="empty-note">Nothing currently lines up with ${elEsc(originA.c)} → ${elEsc(destA.c)}'s direction and general corridor — showing everything else below.</div>`;
+    }
+    html += rest.map(x => elLegRowHtml(x.r, null)).join('');
+    wrap.innerHTML = html;
+  } else {
+    wrap.innerHTML = EMPTY_LEGS_REFERENCE.map(r => elLegRowHtml(r, null)).join('');
+  }
+}
+
+function elLegRowHtml(r, m){
+  const matchBadge = (m && m.isMatch)
+    ? `<span class="el-matchpill">MATCH${m.dist > 20 ? ` · ~${m.dist}mi off route` : ''}</span>`
+    : '';
+  return `
+    <div class="el-ref-row${m && m.isMatch ? ' el-match' : ''}">
       <div class="el-dates">${elEsc(r.dates)}</div>
       <div class="el-route">${r.to
-        ? `${elEsc(r.from)}<span class="arrow">→</span>${elEsc(r.to)}`
+        ? `${elEsc(r.fromLabel)}<span class="arrow">→</span>${elEsc(r.toLabel)}`
         : `<span class="el-note">${elEsc(r.note)}</span>`}</div>
       <div class="el-info">
         <div class="el-op">${elEsc(r.op)}</div>
         <div class="el-aircraft">${elEsc(r.aircraft)}</div>
       </div>
       <div class="el-badges">
+        ${matchBadge}
         <span class="el-catpill">${elEsc(CATS[r.cat]?.label || r.cat)}</span>
         ${r.flag ? `<span class="el-flag">${elEsc(r.flag)}</span>` : ''}
       </div>
     </div>
-  `).join('');
+  `;
 }
 
 async function loadEmptyLegsFromSheet(){
