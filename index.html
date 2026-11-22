@@ -5,6 +5,8 @@
 <title>Sourcing Desk</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/topojson-client@3/dist/topojson-client.min.js"></script>
 <style>
   :root{
     --cream: #131210;
@@ -430,6 +432,25 @@
     .strip-stats{border-left:none;border-top:1px solid var(--line-faint);padding:12px 0 0;justify-content:space-around;}
     table{font-size:0.7rem;}
   }
+
+  /* Mini map */
+  .mini-map-wrap{margin-top:14px;border:1px solid var(--line-faint);border-radius:8px;padding:10px;}
+  .mini-map-svg{display:block;width:100%;height:auto;overflow:hidden;}
+  .mm-sphere{fill:rgba(92,140,184,0.07);stroke:var(--line);stroke-width:0.6;}
+  .mm-land{fill:var(--line-faint);stroke:var(--line);stroke-width:0.4;}
+  .mm-route-trip{stroke:var(--blue);stroke-width:1.6;stroke-dasharray:3,2;}
+  .mm-route-match{stroke:var(--green);stroke-width:1.6;stroke-dasharray:3,2;}
+  .mm-pt-trip{fill:var(--blue);stroke:var(--cream);stroke-width:1;}
+  .mm-pt-match{fill:var(--green);stroke:var(--cream);stroke-width:1;}
+  .mm-label{font-family:'IBM Plex Mono',monospace;font-size:5.5px;fill:var(--ink);text-anchor:middle;}
+  .mini-map-legend{
+    display:flex;gap:16px;margin-top:8px;font-family:'IBM Plex Mono',monospace;
+    font-size:0.65rem;color:var(--ink-soft);flex-wrap:wrap;
+  }
+  .mini-map-legend span{display:inline-flex;align-items:center;gap:5px;}
+  .mini-map-legend i{width:12px;height:2px;display:inline-block;}
+  .mini-map-legend .sw-trip{background:var(--blue);}
+  .mini-map-legend .sw-match{background:var(--green);}
 </style>
 </head>
 <body>
@@ -537,6 +558,7 @@
       <span class="panel-label">Route</span>
       <div id="routeStrips"></div>
       <div id="routeTotal"></div>
+      <div id="miniMapWrap"></div>
     </div>
 
     <div class="panel">
@@ -42822,6 +42844,7 @@ document.getElementById('clearBtn').addEventListener('click', ()=>{
   originA = null;
   destA = null;
   renderEmptyLegsReference();
+  renderMiniMap();
 
   document.getElementById('legsContainer').scrollIntoView({behavior:'smooth', block:'start'});
 });
@@ -42874,6 +42897,7 @@ document.getElementById('planBtn').addEventListener('click', ()=>{
   renderRFQ(resolved, currentCats);
   renderRadiusResults(originA, currentCats);
   renderEmptyLegsReference();
+  renderMiniMap();
 
   document.getElementById('results').classList.remove('hidden');
   document.getElementById('results').scrollIntoView({behavior:'smooth', block:'nearest'});
@@ -43805,6 +43829,7 @@ async function loadEmptyLegsFromSheet(){
   if(!SHEET_CSV_URL || SHEET_CSV_URL.indexOf('PASTE_') === 0){
     elLoadState = 'error'; elErrorDetail = 'no sheet link configured yet';
     renderEmptyLegsReference();
+    renderMiniMap();
     return;
   }
   if(btn){ btn.disabled = true; btn.textContent = 'Refreshing…'; }
@@ -43821,6 +43846,7 @@ async function loadEmptyLegsFromSheet(){
     if(stamp) stamp.textContent = 'Last attempt failed';
   }
   renderEmptyLegsReference();
+  renderMiniMap();
   if(btn){ btn.disabled = false; btn.textContent = 'Refresh'; }
 }
 
@@ -43833,6 +43859,107 @@ document.addEventListener('visibilitychange', ()=>{
 renderEmptyLegsReference();
 loadEmptyLegsFromSheet();
 setInterval(loadEmptyLegsFromSheet, EL_REFRESH_MINUTES * 60 * 1000);
+
+// ===== Mini map: planned trip + closest-matching empty leg, ballpark straight lines =====
+// Regional (fit to the two points) for North-America-ish trips; the whole globe when
+// either trip endpoint falls outside that range (e.g. an int'l leg like EGGW).
+const MAP_W = 360, MAP_H = 230;
+const NA_BOUNDS = { latMin:14, latMax:72, lonMin:-172, lonMax:-52 };
+function inNA(p){ return p.lat>=NA_BOUNDS.latMin && p.lat<=NA_BOUNDS.latMax && p.lon>=NA_BOUNDS.lonMin && p.lon<=NA_BOUNDS.lonMax; }
+
+let WORLD_LAND = null, worldLandPromise = null;
+function loadWorldLand(){
+  if(WORLD_LAND) return Promise.resolve(WORLD_LAND);
+  if(!worldLandPromise){
+    worldLandPromise = fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/land-110m.json')
+      .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+      .then(topo=>{ WORLD_LAND = topojson.feature(topo, topo.objects.land); return WORLD_LAND; })
+      .catch(err=>{ worldLandPromise = null; throw err; });
+  }
+  return worldLandPromise;
+}
+
+// Reuses the exact same computeLegMatch() the Empty Legs panel sorts by — just takes
+// whichever current leg comes out closest to the planned trip's own route.
+function findTopEmptyLegMatch(){
+  if(!originA || !destA) return null;
+  let best = null;
+  EMPTY_LEGS_REFERENCE.forEach(r=>{
+    const m = computeLegMatch(r, originA, destA);
+    if(m && m.isMatch && (!best || m.dist < best.m.dist)) best = { leg:r, m };
+  });
+  return best;
+}
+
+function buildMiniMapSVG(land, topMatch){
+  const tripPts = [originA, destA];
+  const fitPts = topMatch ? tripPts.concat([topMatch.leg.fromAirport, topMatch.leg.toAirport]) : tripPts;
+  const mode = tripPts.every(inNA) ? 'regional' : 'global';
+
+  let projection;
+  if(mode === 'global'){
+    const cLat = fitPts.reduce((s,p)=>s+p.lat,0)/fitPts.length;
+    const cLon = fitPts.reduce((s,p)=>s+p.lon,0)/fitPts.length;
+    projection = d3.geoOrthographic().rotate([-cLon, -cLat])
+      .fitExtent([[6,6],[MAP_W-6,MAP_H-6]], {type:'Sphere'});
+  } else {
+    // Pad to a minimum ~6-degree span so two nearby airports don't zoom in to nothing.
+    const lats = fitPts.map(p=>p.lat), lons = fitPts.map(p=>p.lon);
+    const midLat=(Math.min(...lats)+Math.max(...lats))/2, midLon=(Math.min(...lons)+Math.max(...lons))/2;
+    const spanLat=Math.max(Math.max(...lats)-Math.min(...lats),6), spanLon=Math.max(Math.max(...lons)-Math.min(...lons),6);
+    const fc = { type:'FeatureCollection', features:[
+      {type:'Feature',geometry:{type:'Point',coordinates:[midLon-spanLon/2, midLat-spanLat/2]}},
+      {type:'Feature',geometry:{type:'Point',coordinates:[midLon+spanLon/2, midLat+spanLat/2]}}
+    ]};
+    projection = d3.geoMercator().fitExtent([[26,20],[MAP_W-26,MAP_H-20]], fc);
+  }
+  const geoPath = d3.geoPath(projection);
+
+  function drawRoute(a, b, cls){
+    const pa = projection([a.lon,a.lat]), pb = projection([b.lon,b.lat]);
+    if(!pa || !pb) return '';
+    return `<line class="${cls}" x1="${pa[0].toFixed(1)}" y1="${pa[1].toFixed(1)}" x2="${pb[0].toFixed(1)}" y2="${pb[1].toFixed(1)}"/>`;
+  }
+  function drawPoint(p, cls){
+    const xy = projection([p.lon,p.lat]);
+    if(!xy) return '';
+    return `<circle class="${cls}" cx="${xy[0].toFixed(1)}" cy="${xy[1].toFixed(1)}" r="3"/>`
+         + `<text class="mm-label" x="${xy[0].toFixed(1)}" y="${(xy[1]-6).toFixed(1)}">${elEsc(p.c)}</text>`;
+  }
+
+  let svg = `<svg viewBox="0 0 ${MAP_W} ${MAP_H}" class="mini-map-svg" xmlns="http://www.w3.org/2000/svg">`;
+  if(mode==='global') svg += `<path class="mm-sphere" d="${geoPath({type:'Sphere'})}"/>`;
+  svg += `<path class="mm-land" d="${geoPath(land)}"/>`;
+  if(topMatch) svg += drawRoute(topMatch.leg.fromAirport, topMatch.leg.toAirport, 'mm-route-match');
+  svg += drawRoute(originA, destA, 'mm-route-trip');
+  if(topMatch){
+    svg += drawPoint(topMatch.leg.fromAirport, 'mm-pt-match');
+    svg += drawPoint(topMatch.leg.toAirport, 'mm-pt-match');
+  }
+  svg += drawPoint(originA, 'mm-pt-trip');
+  svg += drawPoint(destA, 'mm-pt-trip');
+  svg += `</svg>`;
+  return svg;
+}
+
+async function renderMiniMap(){
+  const wrap = document.getElementById('miniMapWrap');
+  if(!wrap) return;
+  if(!originA || !destA){ wrap.innerHTML = ''; return; }
+  const askedO = originA, askedD = destA; // guard: trip may change while we're loading
+  wrap.innerHTML = `<div class="empty-note">Loading map…</div>`;
+  let land;
+  try{ land = await loadWorldLand(); }
+  catch(err){ wrap.innerHTML = `<div class="empty-note">Map unavailable right now (couldn't load the world outline data).</div>`; return; }
+  if(originA !== askedO || destA !== askedD) return;
+
+  const topMatch = findTopEmptyLegMatch();
+  wrap.innerHTML = buildMiniMapSVG(land, topMatch) + `
+    <div class="mini-map-legend">
+      <span><i class="sw-trip"></i>${elEsc(originA.c)} → ${elEsc(destA.c)} (planned trip)</span>
+      ${topMatch ? `<span><i class="sw-match"></i>${elEsc(topMatch.leg.op)}: ${elEsc(topMatch.leg.fromAirport.c)} → ${elEsc(topMatch.leg.toAirport.c)} (closest empty-leg match)</span>` : ''}
+    </div>`;
+}
 
 </script>
 </body>
