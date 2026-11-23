@@ -5,8 +5,6 @@
 <title>Sourcing Desk</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/topojson-client@3/dist/topojson-client.min.js"></script>
 <style>
   :root{
     --cream: #131210;
@@ -437,11 +435,17 @@
   .mini-map-wrap{margin-top:14px;border:1px solid var(--line-faint);border-radius:8px;padding:10px;}
   .mini-map-svg{display:block;width:100%;height:auto;overflow:hidden;}
   .mm-sphere{fill:rgba(92,140,184,0.07);stroke:var(--line);stroke-width:0.6;}
-  .mm-land{fill:var(--line-faint);stroke:var(--line);stroke-width:0.4;}
+  .mm-land{fill:var(--line-faint);}
+  .mm-border{fill:none;}
+  .mm-border-country{stroke:var(--ink-soft);stroke-width:0.6;}
+  .mm-border-state{stroke:var(--line);stroke-width:0.35;}
   .mm-route-trip{stroke:var(--blue);stroke-width:1.6;stroke-dasharray:3,2;}
   .mm-route-match{stroke:var(--green);stroke-width:1.6;stroke-dasharray:3,2;}
   .mm-pt-trip{fill:var(--blue);stroke:var(--cream);stroke-width:1;}
   .mm-pt-match{fill:var(--green);stroke:var(--cream);stroke-width:1;}
+  .mm-pt-other{fill:var(--amber);stroke:var(--cream);stroke-width:0.8;}
+  .mm-hit{fill:transparent;cursor:pointer;}
+  .mm-bubble{cursor:pointer;}
   .mm-label{font-family:'IBM Plex Mono',monospace;font-size:5.5px;fill:var(--ink);text-anchor:middle;}
   .mini-map-legend{
     display:flex;gap:16px;margin-top:8px;font-family:'IBM Plex Mono',monospace;
@@ -451,6 +455,7 @@
   .mini-map-legend i{width:12px;height:2px;display:inline-block;}
   .mini-map-legend .sw-trip{background:var(--blue);}
   .mini-map-legend .sw-match{background:var(--green);}
+  .mini-map-legend .sw-other{background:var(--amber);}
 </style>
 </head>
 <body>
@@ -42614,18 +42619,33 @@ function isOperatorWithinLeadTime(opName){
 let aircraftChips = [];
 let radiusManuallySet = false;
 document.getElementById('radiusInput').addEventListener('input', ()=>{ radiusManuallySet = true; });
+// Today's date, and "3 hours from now" rounded to the nearest hour, as the default
+// for every new leg row — computed fresh each time so it's always based on the
+// actual current moment, not a fixed placeholder.
+function defaultLegDate(){
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+function defaultLegTime(){
+  const d = new Date();
+  d.setHours(d.getHours() + 3);
+  if(d.getMinutes() >= 30) d.setHours(d.getHours() + 1);
+  return `${String(d.getHours()).padStart(2,'0')}:00`;
+}
+function blankLeg(){ return {origin:'',dest:'',date:defaultLegDate(),time:defaultLegTime()}; }
+
 let tripType='oneway';
-let legs=[{origin:'',dest:'',date:'2026-01-01',time:''},{origin:'',dest:'',date:'2026-01-01',time:''}];
+let legs=[blankLeg(),blankLeg()];
 
 function ensureLegsForType(){
   if(tripType==='oneway'){
     legs = legs.slice(0,1);
-    if(legs.length===0) legs=[{origin:'',dest:'',date:'2026-01-01',time:''}];
+    if(legs.length===0) legs=[blankLeg()];
   } else if(tripType==='roundtrip'){
-    while(legs.length<2) legs.push({origin:'',dest:'',date:'2026-01-01',time:''});
+    while(legs.length<2) legs.push(blankLeg());
     legs = legs.slice(0,2);
   } else {
-    while(legs.length<2) legs.push({origin:'',dest:'',date:'2026-01-01',time:''});
+    while(legs.length<2) legs.push(blankLeg());
   }
 }
 
@@ -42723,7 +42743,7 @@ document.querySelectorAll('input[name="tripType"]').forEach(r=>{
 });
 
 document.getElementById('addLegBtn').addEventListener('click', ()=>{
-  legs.push({origin:'',dest:'',date:'2026-01-01',time:''});
+  legs.push(blankLeg());
   renderLegs();
 });
 
@@ -42808,7 +42828,7 @@ document.getElementById('lookupBase').addEventListener('input', runOperatorLooku
 document.getElementById('clearBtn').addEventListener('click', ()=>{
   tripType = 'oneway';
   document.querySelector('input[name="tripType"][value="oneway"]').checked = true;
-  legs = [{origin:'',dest:'',date:'2026-01-01',time:''},{origin:'',dest:'',date:'2026-01-01',time:''}];
+  legs = [blankLeg(),blankLeg()];
   renderLegs();
 
   document.querySelectorAll('input[name="catCheck"]').forEach(el=>{
@@ -43860,23 +43880,65 @@ renderEmptyLegsReference();
 loadEmptyLegsFromSheet();
 setInterval(loadEmptyLegsFromSheet, EL_REFRESH_MINUTES * 60 * 1000);
 
-// ===== Mini map: planned trip + closest-matching empty leg, ballpark straight lines =====
-// Regional (fit to the two points) for North-America-ish trips; the whole globe when
-// either trip endpoint falls outside that range (e.g. an int'l leg like EGGW).
+// ===== Mini map: always-on US map; trip route + closest matching empty leg once a
+// trip is planned; hoverable bubbles for every airport the live empty-legs feed touches =====
 const MAP_W = 360, MAP_H = 230;
 const NA_BOUNDS = { latMin:14, latMax:72, lonMin:-172, lonMax:-52 };
+const NEIGHBOR_NM = 20;
 function inNA(p){ return p.lat>=NA_BOUNDS.latMin && p.lat<=NA_BOUNDS.latMax && p.lon>=NA_BOUNDS.lonMin && p.lon<=NA_BOUNDS.lonMax; }
 
-let WORLD_LAND = null, worldLandPromise = null;
-function loadWorldLand(){
-  if(WORLD_LAND) return Promise.resolve(WORLD_LAND);
-  if(!worldLandPromise){
-    worldLandPromise = fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/land-110m.json')
-      .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
-      .then(topo=>{ WORLD_LAND = topojson.feature(topo, topo.objects.land); return WORLD_LAND; })
-      .catch(err=>{ worldLandPromise = null; throw err; });
+// d3 + topojson-client load on demand, the first time the map actually needs them —
+// never from a blocking <script> tag, so a slow/unreachable CDN can only ever affect
+// the map itself, never the rest of the page (this is also the fix for the empty-legs
+// panel hanging on "Loading…": the previous version loaded these from <head>, which
+// blocks the whole page's script from running at all until they resolve).
+let mapLibsPromise = null;
+function loadScriptOnce(src){
+  return new Promise((resolve, reject)=>{
+    const existing = document.querySelector(`script[data-src="${src}"]`);
+    if(existing){
+      if(existing.dataset.loaded === '1') return resolve();
+      existing.addEventListener('load', ()=>resolve());
+      existing.addEventListener('error', ()=>reject(new Error('failed to load '+src)));
+      return;
+    }
+    const s = document.createElement('script');
+    s.src = src; s.dataset.src = src;
+    s.onload = ()=>{ s.dataset.loaded = '1'; resolve(); };
+    s.onerror = ()=>reject(new Error('failed to load '+src));
+    document.head.appendChild(s);
+  });
+}
+function loadMapLibs(){
+  if(typeof d3 !== 'undefined' && typeof topojson !== 'undefined') return Promise.resolve();
+  if(!mapLibsPromise){
+    mapLibsPromise = Promise.all([
+      loadScriptOnce('https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js'),
+      loadScriptOnce('https://cdn.jsdelivr.net/npm/topojson-client@3/dist/topojson-client.min.js')
+    ]).catch(err=>{ mapLibsPromise = null; throw err; });
   }
-  return worldLandPromise;
+  return mapLibsPromise;
+}
+
+// World country outlines/borders + US state borders, fetched once and cached.
+let MAP_DATA = null, mapDataPromise = null;
+function loadMapData(){
+  if(MAP_DATA) return Promise.resolve(MAP_DATA);
+  if(!mapDataPromise){
+    mapDataPromise = Promise.all([
+      fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json').then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }),
+      fetch('https://cdn.jsdelivr.net/npm/us-atlas@3/states-10m.json').then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+    ]).then(([worldTopo, usTopo])=>{
+      MAP_DATA = {
+        countries: topojson.feature(worldTopo, worldTopo.objects.countries),
+        countryBorders: topojson.mesh(worldTopo, worldTopo.objects.countries, (a,b)=>a!==b),
+        states: topojson.feature(usTopo, usTopo.objects.states),
+        stateBorders: topojson.mesh(usTopo, usTopo.objects.states, (a,b)=>a!==b)
+      };
+      return MAP_DATA;
+    }).catch(err=>{ mapDataPromise = null; throw err; });
+  }
+  return mapDataPromise;
 }
 
 // Reuses the exact same computeLegMatch() the Empty Legs panel sorts by — just takes
@@ -43891,13 +43953,52 @@ function findTopEmptyLegMatch(){
   return best;
 }
 
-function buildMiniMapSVG(land, topMatch){
-  const tripPts = [originA, destA];
+// Every distinct airport the live feed currently touches, with the operator/aircraft
+// pairs seen there (deduped), for the hoverable bubbles.
+function buildEmptyLegAirportIndex(){
+  const idx = {};
+  EMPTY_LEGS_REFERENCE.forEach(r=>{
+    [r.fromAirport, r.toAirport].forEach(a=>{
+      if(!a) return;
+      if(!idx[a.c]) idx[a.c] = { airport:a, entries:[] };
+      idx[a.c].entries.push({ op:r.op, aircraft:r.aircraft });
+    });
+  });
+  return Object.values(idx);
+}
+// Airports from that index within NEIGHBOR_NM of a point (nearest first); if none are
+// that close, fall back to just the single nearest one so there's always something.
+function neighborsFor(point, airportIndex){
+  if(!airportIndex.length) return [];
+  const withDist = airportIndex.map(e=>({ ...e, nm: haversineNM(point, e.airport) }));
+  const within = withDist.filter(e=>e.nm <= NEIGHBOR_NM).sort((a,b)=>a.nm-b.nm);
+  if(within.length) return within;
+  return [withDist.reduce((best,e)=> (!best || e.nm<best.nm) ? e : best)];
+}
+function airportTooltip(entry, distNm){
+  const lines = [`${entry.airport.c} — ${entry.airport.n}`];
+  const seen = new Set(), uniq = [];
+  entry.entries.forEach(e=>{
+    const key = e.op+'|'+e.aircraft;
+    if(seen.has(key)) return;
+    seen.add(key); uniq.push(`${e.op}: ${e.aircraft}`);
+  });
+  uniq.slice(0,10).forEach(l=>lines.push(l));
+  if(uniq.length>10) lines.push(`+${uniq.length-10} more`);
+  if(distNm !== undefined) lines.push(`${distNm<1 ? '<1' : Math.round(distNm)} nm away`);
+  return lines.join('\n');
+}
+
+function buildMiniMapSVG(mapData, topMatch, neighborLists){
+  const planned = !!(originA && destA);
+  const tripPts = planned ? [originA, destA] : [];
   const fitPts = topMatch ? tripPts.concat([topMatch.leg.fromAirport, topMatch.leg.toAirport]) : tripPts;
-  const mode = tripPts.every(inNA) ? 'regional' : 'global';
+  const mode = !planned ? 'us' : (tripPts.every(inNA) ? 'regional' : 'global');
 
   let projection;
-  if(mode === 'global'){
+  if(mode === 'us'){
+    projection = d3.geoAlbersUsa().fitExtent([[8,8],[MAP_W-8,MAP_H-8]], mapData.states);
+  } else if(mode === 'global'){
     const cLat = fitPts.reduce((s,p)=>s+p.lat,0)/fitPts.length;
     const cLon = fitPts.reduce((s,p)=>s+p.lon,0)/fitPts.length;
     projection = d3.geoOrthographic().rotate([-cLon, -cLat])
@@ -43923,21 +44024,41 @@ function buildMiniMapSVG(land, topMatch){
   function drawPoint(p, cls){
     const xy = projection([p.lon,p.lat]);
     if(!xy) return '';
-    return `<circle class="${cls}" cx="${xy[0].toFixed(1)}" cy="${xy[1].toFixed(1)}" r="3"/>`
+    return `<circle class="${cls}" cx="${xy[0].toFixed(1)}" cy="${xy[1].toFixed(1)}" r="3.2"/>`
          + `<text class="mm-label" x="${xy[0].toFixed(1)}" y="${(xy[1]-6).toFixed(1)}">${elEsc(p.c)}</text>`;
+  }
+  function drawBubble(entry, cls, distNm){
+    const xy = projection([entry.airport.lon, entry.airport.lat]);
+    if(!xy) return '';
+    return `<g class="mm-bubble"><title>${elEsc(airportTooltip(entry, distNm))}</title>`
+         + `<circle class="mm-hit" cx="${xy[0].toFixed(1)}" cy="${xy[1].toFixed(1)}" r="8"/>`
+         + `<circle class="${cls}" cx="${xy[0].toFixed(1)}" cy="${xy[1].toFixed(1)}" r="3"/></g>`;
   }
 
   let svg = `<svg viewBox="0 0 ${MAP_W} ${MAP_H}" class="mini-map-svg" xmlns="http://www.w3.org/2000/svg">`;
   if(mode==='global') svg += `<path class="mm-sphere" d="${geoPath({type:'Sphere'})}"/>`;
-  svg += `<path class="mm-land" d="${geoPath(land)}"/>`;
-  if(topMatch) svg += drawRoute(topMatch.leg.fromAirport, topMatch.leg.toAirport, 'mm-route-match');
-  svg += drawRoute(originA, destA, 'mm-route-trip');
+  if(mode==='us'){
+    svg += `<path class="mm-land" d="${geoPath(mapData.states)}"/>`;
+    svg += `<path class="mm-border mm-border-state" d="${geoPath(mapData.stateBorders)}"/>`;
+  } else {
+    svg += `<path class="mm-land" d="${geoPath(mapData.countries)}"/>`;
+    svg += `<path class="mm-border mm-border-country" d="${geoPath(mapData.countryBorders)}"/>`;
+    if(mode==='regional') svg += `<path class="mm-border mm-border-state" d="${geoPath(mapData.stateBorders)}"/>`;
+  }
+
+  if(planned){
+    if(topMatch) svg += drawRoute(topMatch.leg.fromAirport, topMatch.leg.toAirport, 'mm-route-match');
+    svg += drawRoute(originA, destA, 'mm-route-trip');
+  }
+  (neighborLists||[]).forEach(list=> list.forEach(entry=> svg += drawBubble(entry, 'mm-pt-other', entry.nm)));
   if(topMatch){
     svg += drawPoint(topMatch.leg.fromAirport, 'mm-pt-match');
     svg += drawPoint(topMatch.leg.toAirport, 'mm-pt-match');
   }
-  svg += drawPoint(originA, 'mm-pt-trip');
-  svg += drawPoint(destA, 'mm-pt-trip');
+  if(planned){
+    svg += drawPoint(originA, 'mm-pt-trip');
+    svg += drawPoint(destA, 'mm-pt-trip');
+  }
   svg += `</svg>`;
   return svg;
 }
@@ -43945,21 +44066,42 @@ function buildMiniMapSVG(land, topMatch){
 async function renderMiniMap(){
   const wrap = document.getElementById('miniMapWrap');
   if(!wrap) return;
-  if(!originA || !destA){ wrap.innerHTML = ''; return; }
-  const askedO = originA, askedD = destA; // guard: trip may change while we're loading
+  const askedO = originA, askedD = destA; // guard against the trip changing while we load
   wrap.innerHTML = `<div class="empty-note">Loading map…</div>`;
-  let land;
-  try{ land = await loadWorldLand(); }
-  catch(err){ wrap.innerHTML = `<div class="empty-note">Map unavailable right now (couldn't load the world outline data).</div>`; return; }
+  let mapData;
+  try{
+    await loadMapLibs();
+    mapData = await loadMapData();
+  } catch(err){
+    wrap.innerHTML = `<div class="empty-note">Map unavailable right now (couldn't load the map/border data).</div>`;
+    return;
+  }
   if(originA !== askedO || destA !== askedD) return;
 
   const topMatch = findTopEmptyLegMatch();
-  wrap.innerHTML = buildMiniMapSVG(land, topMatch) + `
+  const airportIndex = buildEmptyLegAirportIndex();
+  let neighborLists, legendExtra = '';
+  if(originA && destA){
+    neighborLists = [neighborsFor(originA, airportIndex), neighborsFor(destA, airportIndex)];
+    const codes = [...new Set([...neighborLists[0], ...neighborLists[1]].map(e=>e.airport.c))];
+    if(codes.length){
+      const shown = codes.slice(0,6).join(', ');
+      legendExtra = `<span><i class="sw-other"></i>Neighboring: ${elEsc(shown)}${codes.length>6?` +${codes.length-6} more`:''}</span>`;
+    }
+  } else {
+    neighborLists = [airportIndex];
+  }
+
+  wrap.innerHTML = buildMiniMapSVG(mapData, topMatch, neighborLists) + `
     <div class="mini-map-legend">
-      <span><i class="sw-trip"></i>${elEsc(originA.c)} → ${elEsc(destA.c)} (planned trip)</span>
+      ${originA && destA
+        ? `<span><i class="sw-trip"></i>${elEsc(originA.c)} → ${elEsc(destA.c)} (planned trip)</span>`
+        : `<span>Hover an airport to see aircraft seen there.</span>`}
       ${topMatch ? `<span><i class="sw-match"></i>${elEsc(topMatch.leg.op)}: ${elEsc(topMatch.leg.fromAirport.c)} → ${elEsc(topMatch.leg.toAirport.c)} (closest empty-leg match)</span>` : ''}
+      ${legendExtra}
     </div>`;
 }
+renderMiniMap();
 
 </script>
 </body>
