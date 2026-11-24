@@ -43793,7 +43793,15 @@ function renderEmptyLegsReference(){
     return;
   }
   if(elLoadState === 'error' && EMPTY_LEGS_REFERENCE.length === 0){
-    wrap.innerHTML = `<div class="empty-note" style="color:var(--red);">Couldn't load live data (${elEsc(elErrorDetail)}). Check that the tab is shared/published as described in the code comments above this, and that the link there matches it — then hit Refresh.</div>`;
+    wrap.innerHTML = `<div class="empty-note" style="color:var(--red);">
+      Couldn't load live data (${elEsc(elErrorDetail)}) — almost always means the sheet isn't shared as "Anyone with the link" yet, or the tab/link no longer matches.
+      <br><br>
+      Open this exact link in a new tab: if it asks you to sign in, or shows anything other than plain comma-separated text, that confirms it.
+      <br>
+      <a href="${elEsc(SHEET_CSV_URL)}" target="_blank" rel="noopener" style="color:var(--blue);word-break:break-all;">${elEsc(SHEET_CSV_URL)}</a>
+      <br><br>
+      Fix the sharing (or swap in a Publish-to-web link per the code comments above this), then hit Refresh.
+    </div>`;
     return;
   }
   if(EMPTY_LEGS_REFERENCE.length === 0){
